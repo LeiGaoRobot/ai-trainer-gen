@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Virtual envs
+.venv/
+env/
+venv/
+
+# pytest / coverage
+.pytest_cache/
+pytest-cache-files-*/
+.coverage
+htmlcov/
+
+# SQLite databases
+*.db
+*.sqlite3
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Word / Office docs (keep .md only)
+*.docx
+*.xlsx
+*.pptx
