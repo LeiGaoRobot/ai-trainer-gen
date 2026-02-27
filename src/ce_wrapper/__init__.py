@@ -3,6 +3,7 @@ ce_wrapper — Cheat Engine integration layer.
 
 Public API
 ──────────
+CEBridge          — COM automation wrapper for a running CE instance
 CEProcess         — attached process descriptor
 InjectionResult   — result of a script injection attempt
 CTBuilder         — serialises GeneratedScript → .ct XML

@@ -358,6 +358,14 @@ class TestCEBridge:
         hits = bridge.validate_aob(_make_aob(), MagicMock())
         assert hits == []
 
+    def test_validate_aob_raises_if_not_connected(self):
+        """validate_aob() raises BridgeError when called before connect()."""
+        from src.ce_wrapper.com_bridge import CEBridge
+        from src.exceptions import BridgeError
+        bridge = CEBridge()
+        with pytest.raises(BridgeError, match="Not connected"):
+            bridge.validate_aob(_make_aob(), MagicMock())
+
     def test_context_manager_calls_close(self):
         """Using CEBridge as a context manager calls close() on exit."""
         from src.ce_wrapper.com_bridge import CEBridge

@@ -74,8 +74,12 @@ class CEBridge:
             )
         factory = self._com_factory or self._default_com_factory
         self._app = factory()
-        pid = self._app.OpenedProcessID
-        name = self._app.OpenedProcessName
+        try:
+            pid  = self._app.OpenedProcessID
+            name = self._app.OpenedProcessName
+        except Exception as exc:  # noqa: BLE001
+            self._app = None
+            raise BridgeError(f"CE is running but no process is attached: {exc}") from exc
         logger.info("CEBridge: connected to %s (pid=%s)", name, pid)
         return CEProcess(pid=pid, name=name)
 
@@ -131,10 +135,16 @@ class CEBridge:
     def __exit__(self, *args: Any) -> None:
         self.close()
 
-    def _default_com_factory(self) -> Any:
+    @staticmethod
+    def _default_com_factory() -> Any:
+        """
+        Build the real Cheat Engine COM application object.
+
+        Imported lazily to keep the module importable on non-Windows.
+        Raises BridgeNotAvailableError if pywin32 is not installed.
+        """
         try:
             import win32com.client  # type: ignore[import]
-
             return win32com.client.Dispatch(_CE_PROG_ID)
         except ImportError as exc:
             raise BridgeNotAvailableError(
