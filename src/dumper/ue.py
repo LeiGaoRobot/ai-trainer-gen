@@ -16,7 +16,7 @@ import time
 from pathlib import Path
 
 from src.detector.models import EngineInfo, EngineType
-from src.exceptions import DumperError
+from src.exceptions import DumperError, DumpTimeoutError
 from .base import AbstractDumper
 from .models import ClassInfo, FieldInfo, StructureJSON
 
@@ -39,6 +39,10 @@ _UE4SS_MARKERS = [
 
 _DUMP_POLL_INTERVAL = 0.5   # seconds between existence checks
 _DUMP_TIMEOUT = 60.0        # total seconds to wait for ObjectDump.txt
+
+_VK_F10     = 0x79   # Virtual key code for F10
+_WM_KEYDOWN = 0x100  # WM_KEYDOWN message
+_WM_KEYUP   = 0x101  # WM_KEYUP message
 
 # ObjectDump.txt line patterns (UE4SS format)
 _CLASS_LINE_RE = re.compile(r"^Class\s+([\w:./]+)")
@@ -102,6 +106,13 @@ class UnrealDumper(AbstractDumper):
 
         Raises DumperError with clear instructions if any step fails.
         """
+        if not _IS_WINDOWS:
+            raise DumperError(
+                "Auto UE4SS dump requires Windows. "
+                "On other platforms, run the game with UE4SS and press F10 "
+                "to generate ObjectDump.txt, then re-run this tool."
+            )
+
         if not self._detect_ue4ss(game_dir):
             raise DumperError(
                 "UE4SS is not installed in the game directory.\n"
@@ -111,13 +122,6 @@ class UnrealDumper(AbstractDumper):
                 f"     {game_dir}\n"
                 "  3. Launch the game and press F10 to dump objects.\n"
                 "  4. Re-run ai-trainer-gen."
-            )
-
-        if not _IS_WINDOWS:
-            raise DumperError(
-                "Auto UE4SS dump requires Windows. "
-                "On other platforms, run the game with UE4SS and press F10 "
-                "to generate ObjectDump.txt, then re-run this tool."
             )
 
         logger.info("UE4SS detected in %s, sending F10 to game window...", game_dir)
@@ -132,16 +136,16 @@ class UnrealDumper(AbstractDumper):
             )
 
         dump_file = game_dir / "ObjectDump.txt"
-        print(f"Waiting for ObjectDump.txt (up to {_DUMP_TIMEOUT:.0f}s)...")
-        elapsed = 0.0
-        while elapsed < _DUMP_TIMEOUT:
+        logger.info("Waiting for ObjectDump.txt (up to %ds)...", int(_DUMP_TIMEOUT))
+        deadline = time.monotonic() + _DUMP_TIMEOUT
+        while time.monotonic() < deadline:
             if dump_file.exists():
+                elapsed = _DUMP_TIMEOUT - (deadline - time.monotonic())
                 logger.info("ObjectDump.txt appeared after %.1fs", elapsed)
                 return
             time.sleep(_DUMP_POLL_INTERVAL)
-            elapsed += _DUMP_POLL_INTERVAL
 
-        raise DumperError(
+        raise DumpTimeoutError(
             f"ObjectDump.txt did not appear within {_DUMP_TIMEOUT:.0f}s. "
             "Make sure UE4SS is loaded (check UE4SS.log) and try pressing F10 manually."
         )
@@ -154,12 +158,10 @@ class UnrealDumper(AbstractDumper):
         Returns True if a matching window was found and key was sent.
         Returns False if no matching window was found.
         """
+        if not _IS_WINDOWS:
+            return False
         import ctypes
         import ctypes.wintypes as wt
-
-        VK_F10    = 0x79
-        WM_KEYDOWN = 0x100
-        WM_KEYUP   = 0x101
 
         windows_found: list[tuple[int, str]] = []
 
@@ -179,8 +181,8 @@ class UnrealDumper(AbstractDumper):
         target = exe_base_name.lower()
         for hwnd, title in windows_found:
             if target in title.lower():
-                ctypes.windll.user32.PostMessageW(hwnd, WM_KEYDOWN, VK_F10, 0)
-                ctypes.windll.user32.PostMessageW(hwnd, WM_KEYUP,   VK_F10, 0)
+                ctypes.windll.user32.PostMessageW(hwnd, _WM_KEYDOWN, _VK_F10, 0)
+                ctypes.windll.user32.PostMessageW(hwnd, _WM_KEYUP,   _VK_F10, 0)
                 logger.debug("Sent F10 to window '%s' (hwnd=0x%X)", title, hwnd)
                 return True
 

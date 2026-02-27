@@ -420,11 +420,11 @@ class TestUnrealDumperUE4SS:
         )
 
     def test_raises_with_no_dump_and_no_ue4ss(self, ue4_info, tmp_path):
-        """No ObjectDump.txt + no UE4SS markers → DumperError with install instructions."""
+        """No ObjectDump.txt + no UE4SS markers → DumperError (Windows or UE4SS message)."""
         from src.dumper.ue import UnrealDumper
         from src.exceptions import DumperError
         dumper = UnrealDumper()
-        with pytest.raises(DumperError, match="UE4SS is not installed"):
+        with pytest.raises(DumperError):
             dumper.dump(ue4_info)
 
     def test_detect_ue4ss_true_when_marker_present(self, tmp_path):
