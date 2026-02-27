@@ -254,7 +254,7 @@ def cmd_generate(
     record = ScriptRecord(
         game_hash=game_hash,
         game_name=game_name,
-        engine_type=str(engine_info.type),
+        engine_type=engine_info.type.value,
         feature=feature,
         lua_script=script.lua_code,
         aob_sigs=aob_json,
