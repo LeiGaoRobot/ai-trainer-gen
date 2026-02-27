@@ -212,3 +212,186 @@ namespace UnityEngine {
         assert len(classes) == 1
         assert classes[0].name == "Vector3"
         assert len(classes[0].fields) == 3
+
+
+class TestUnityMonoDumperWalkAssemblies:
+    """
+    Test _MonoReader internals via mocked pymem.
+    No Windows or running game required.
+    """
+
+    @pytest.fixture
+    def reader(self):
+        """_MonoReader with a pre-populated _exports dict (no attach needed)."""
+        from src.dumper.unity_mono import _MonoReader
+        r = _MonoReader("Game.exe", "C:/mono-2.0-bdwgc.dll")
+        # Simulate resolved exports
+        r._exports = {
+            "mono_domain_get": 0x7FF000001000,
+        }
+        return r
+
+    def test_read_ptr_reads_8_bytes_le(self, reader):
+        """_read_ptr reads 8 bytes as a little-endian unsigned int."""
+        from unittest.mock import MagicMock
+        reader._pm = MagicMock()
+        reader._pm.read_bytes.return_value = b"\x01\x00\x00\x00\x00\x00\x00\x00"
+        assert reader._read_ptr(0x1000) == 1
+
+    def test_read_int32_reads_4_bytes_le(self, reader):
+        """_read_int32 reads 4 bytes as a little-endian unsigned int."""
+        from unittest.mock import MagicMock
+        reader._pm = MagicMock()
+        reader._pm.read_bytes.return_value = b"\x0A\x00\x00\x00"
+        assert reader._read_int32(0x1000) == 10
+
+    def test_read_cstring_stops_at_null(self, reader):
+        """_read_cstring returns the string up to the first null byte."""
+        from unittest.mock import MagicMock
+        reader._pm = MagicMock()
+        reader._pm.read_bytes.return_value = b"PlayerController\x00garbage"
+        result = reader._read_cstring(0x2000)
+        assert result == "PlayerController"
+
+    def test_find_root_domain_parses_mov_rax(self, reader):
+        """_find_root_domain_ptr finds MOV RAX, [RIP+disp] and follows it."""
+        from unittest.mock import MagicMock, patch
+        reader._pm = MagicMock()
+
+        # Construct minimal function body: MOV RAX, [RIP+5]; RET
+        # Instruction: 48 8B 05 05 00 00 00  (7 bytes, disp=5)
+        # RIP at end of instruction = fn_va + 7
+        # global_va = (fn_va + 7) + 5 = fn_va + 12
+        fn_va = reader._exports["mono_domain_get"]
+        code = b"\x48\x8B\x05\x05\x00\x00\x00" + b"\xC3" + b"\x00" * 24
+        domain_ptr = 0xDEADBEEF00000001
+
+        def fake_read_bytes(addr, size):
+            if addr == fn_va:
+                return code
+            if addr == fn_va + 12:  # global_va
+                return domain_ptr.to_bytes(8, "little")
+            return b"\x00" * size
+
+        reader._pm.read_bytes.side_effect = fake_read_bytes
+        result = reader._find_root_domain_ptr()
+        assert result == domain_ptr
+
+    def test_find_root_domain_raises_if_no_mov_rax(self, reader):
+        """_find_root_domain_ptr raises DumperError if pattern not found."""
+        from unittest.mock import MagicMock
+        from src.exceptions import DumperError
+        reader._pm = MagicMock()
+        fn_va = reader._exports["mono_domain_get"]
+        reader._pm.read_bytes.return_value = b"\x90" * 32  # all NOPs
+        with pytest.raises(DumperError, match="mono_domain_get"):
+            reader._find_root_domain_ptr()
+
+    def test_walk_assemblies_returns_classes_from_glist(self, reader):
+        """_walk_assemblies traverses GList and returns ClassInfo objects."""
+        from unittest.mock import MagicMock, patch
+
+        reader._pm = MagicMock()
+
+        # Layout (64-bit addresses):
+        DOMAIN   = 0x10000
+        GLIST1   = 0x20000
+        ASSEMBLY = 0x30000
+        IMAGE    = 0x40000
+
+        # Assembly image name string
+        IMG_NAME_STR = 0x50000
+        # Class name string
+        CLASS_NAME_STR = 0x60000
+        # Namespace string
+        NS_STR = 0x70000
+
+        import struct
+
+        def mk_ptr(v: int) -> bytes:
+            return struct.pack("<Q", v)
+
+        memory = {
+            # domain->domain_assemblies at DOMAIN + 0xD0
+            DOMAIN + 0xD0: mk_ptr(GLIST1),
+            # GList node 1: data=ASSEMBLY, next=0 (end of list)
+            GLIST1 + 0x00: mk_ptr(ASSEMBLY),
+            GLIST1 + 0x08: mk_ptr(0),         # next = NULL
+            # MonoAssembly->image at ASSEMBLY + 0x60
+            ASSEMBLY + 0x60: mk_ptr(IMAGE),
+            # MonoImage->assembly_name (char*) at IMAGE + 0x10
+            IMAGE + 0x10: mk_ptr(IMG_NAME_STR),
+            # MonoImage->n_typedef_rows at IMAGE + 0x18
+            IMAGE + 0x18: struct.pack("<I", 1),  # 1 class
+            # MonoImage->typedef_names at IMAGE + 0x20 (ptr to array of char*)
+            IMAGE + 0x20: mk_ptr(CLASS_NAME_STR),
+            IMAGE + 0x28: mk_ptr(NS_STR),
+            # Strings
+            IMG_NAME_STR:   b"Assembly-CSharp\x00",
+            CLASS_NAME_STR: b"PlayerController\x00",
+            NS_STR:         b"Game.Player\x00",
+        }
+
+        def fake_read(addr, size):
+            for base, data in memory.items():
+                if addr == base:
+                    return data[:size]
+            return b"\x00" * size
+
+        reader._pm.read_bytes.side_effect = fake_read
+
+        # Patch _find_root_domain_ptr to return our fake domain
+        with patch.object(reader, "_find_root_domain_ptr", return_value=DOMAIN):
+            classes = reader._walk_assemblies()
+
+        assert len(classes) >= 1
+        names = [c.name for c in classes]
+        assert "PlayerController" in names
+
+    def test_walk_assemblies_handles_null_assembly_gracefully(self, reader):
+        """NULL assembly pointer in GList is skipped without crashing."""
+        from unittest.mock import MagicMock, patch
+        import struct
+
+        reader._pm = MagicMock()
+        DOMAIN = 0x10000
+        GLIST1 = 0x20000
+
+        def mk_ptr(v): return struct.pack("<Q", v)
+        memory = {
+            DOMAIN + 0xD0: mk_ptr(GLIST1),
+            GLIST1 + 0x00: mk_ptr(0),   # NULL assembly
+            GLIST1 + 0x08: mk_ptr(0),   # end of list
+        }
+        reader._pm.read_bytes.side_effect = lambda a, s: memory.get(a, b"\x00"*s)[:s]
+
+        with patch.object(reader, "_find_root_domain_ptr", return_value=DOMAIN):
+            classes = reader._walk_assemblies()
+
+        assert classes == []
+
+    def test_walk_assemblies_caps_at_max_assemblies(self, reader):
+        """GList longer than _MAX_ASSEMBLIES is capped (infinite loop prevention)."""
+        from unittest.mock import MagicMock, patch
+        import struct
+
+        reader._pm = MagicMock()
+        DOMAIN = 0x10000
+
+        # Build a long GList (each node has NULL assembly, so they're all skipped)
+        nodes = list(range(0x20000, 0x20000 + 600 * 0x10, 0x10))  # 600 nodes
+
+        def mk_ptr(v): return struct.pack("<Q", v)
+
+        memory: dict = {DOMAIN + 0xD0: mk_ptr(nodes[0])}
+        for i, node in enumerate(nodes):
+            memory[node + 0x00] = mk_ptr(0)         # NULL assembly (skip)
+            memory[node + 0x08] = mk_ptr(nodes[i+1] if i < len(nodes)-1 else 0)
+
+        reader._pm.read_bytes.side_effect = lambda a, s: memory.get(a, b"\x00"*s)[:s]
+
+        with patch.object(reader, "_find_root_domain_ptr", return_value=DOMAIN):
+            classes = reader._walk_assemblies()
+
+        # Should not hang; returns empty list (all NULL assemblies)
+        assert isinstance(classes, list)

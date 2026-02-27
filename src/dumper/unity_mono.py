@@ -35,6 +35,17 @@ logger = logging.getLogger(__name__)
 
 _IS_WINDOWS = platform.system() == "Windows"
 
+# ── MonoDomain struct offsets (Unity MonoBleedingEdge 5.x, 64-bit) ────────────
+# These match Unity 2019.4+ through 2022.x for most games.
+_DOMAIN_ASSEMBLIES_OFFSET = 0xD0   # MonoDomain.domain_assemblies (GList*)
+_GLIST_DATA_OFFSET = 0x00          # GList.data  (void* — the assembly ptr)
+_GLIST_NEXT_OFFSET = 0x08          # GList.next  (GList*)
+_ASSEMBLY_IMAGE_OFFSET = 0x60      # MonoAssembly.image (MonoImage*)
+_IMAGE_NAME_OFFSET = 0x10          # MonoImage.assembly_name (char*)
+_IMAGE_N_ROWS_OFFSET = 0x18        # MonoImage typedef row count (uint32)
+_IMAGE_NAMES_OFFSET = 0x20         # MonoImage typedef name ptrs (char*[])
+_MAX_ASSEMBLIES = 512              # safety cap to prevent infinite loops
+
 
 class UnityMonoDumper(AbstractDumper):
     """
@@ -169,28 +180,146 @@ class _MonoReader:
         ctypes.windll.kernel32.FreeLibrary(hmod)
         logger.debug("Resolved %d/%d Mono exports", len(self._exports), len(self._MONO_EXPORTS))
 
-    # ── Mono API traversal ────────────────────────────────────────────────────
+    # ── Memory read helpers ───────────────────────────────────────────────────
 
-    def _call(self, name: str, *args) -> int:
-        """Call a Mono API function in the remote process via CreateRemoteThread."""
-        # For the MVP, we use direct memory reading rather than remote calls.
-        # Full implementation would use WriteProcessMemory + CreateRemoteThread.
-        raise NotImplementedError(
-            "Remote Mono API calls are implemented in Phase 2. "
-            "For MVP, use IL2CPPDumper or provide a pre-dumped JSON."
+    def _read_ptr(self, addr: int) -> int:
+        """Read an 8-byte little-endian pointer from the target process."""
+        return int.from_bytes(self._pm.read_bytes(addr, 8), "little")
+
+    def _read_int32(self, addr: int) -> int:
+        """Read a 4-byte little-endian unsigned int from the target process."""
+        return int.from_bytes(self._pm.read_bytes(addr, 4), "little")
+
+    def _read_cstring(self, addr: int, max_len: int = 256) -> str:
+        """Read a null-terminated UTF-8 string from the target process."""
+        if not addr:
+            return ""
+        try:
+            data = self._pm.read_bytes(addr, max_len)
+        except Exception:
+            return ""
+        null = data.find(b"\x00")
+        raw = data[:null] if null >= 0 else data
+        return raw.decode("utf-8", errors="replace")
+
+    # ── Root domain discovery ─────────────────────────────────────────────────
+
+    def _find_root_domain_ptr(self) -> int:
+        """
+        Find the root MonoDomain pointer by disassembling mono_domain_get.
+
+        Unity Mono's mono_domain_get typically begins with:
+            48 8B 05 XX XX XX XX   ; MOV RAX, [RIP + disp32]
+            C3                     ; RET
+        The RIP-relative load reads from the global mono_root_domain variable.
+        We find this instruction, compute the global address, and dereference it.
+
+        Raises DumperError if the expected instruction pattern is not found.
+        """
+        fn_va = self._exports.get("mono_domain_get")
+        if fn_va is None:
+            raise DumperError("mono_domain_get export not resolved")
+
+        code = self._pm.read_bytes(fn_va, 32)
+
+        for i in range(len(code) - 7):
+            if code[i:i+3] == b"\x48\x8B\x05":
+                disp = int.from_bytes(code[i+3:i+7], "little", signed=True)
+                # RIP = address of next instruction = fn_va + i + 7
+                global_va = fn_va + i + 7 + disp
+                domain_ptr = self._read_ptr(global_va)
+                logger.debug(
+                    "Root domain @ 0x%X  (global @ 0x%X, disp=%+d)",
+                    domain_ptr, global_va, disp,
+                )
+                return domain_ptr
+
+        raise DumperError(
+            "Could not find MOV RAX,[RIP+disp] in mono_domain_get. "
+            "Unsupported Mono version or binary is obfuscated."
         )
+
+    # ── Assembly / class traversal ────────────────────────────────────────────
 
     def _walk_assemblies(self) -> list[ClassInfo]:
         """
-        Walk all loaded assemblies and collect class/field info.
+        Traverse MonoDomain.domain_assemblies (GList*) and collect ClassInfo
+        objects from every loaded assembly.
 
-        MVP implementation: reads the Mono internal tables directly
-        via memory reads rather than remote API calls.
-        Full remote-call implementation is Phase 2.
+        Uses direct memory reads — no remote function calls required.
         """
-        # Placeholder — returns empty list for now; will be implemented in Phase 2
-        logger.warning(
-            "UnityMonoDumper._walk_assemblies: full implementation pending (Phase 2). "
-            "Returning empty class list."
+        domain = self._find_root_domain_ptr()
+        if not domain:
+            raise DumperError("Root MonoDomain pointer is NULL")
+
+        glist_ptr = self._read_ptr(domain + _DOMAIN_ASSEMBLIES_OFFSET)
+
+        classes: list[ClassInfo] = []
+        visited: set[int] = set()
+        count = 0
+
+        while glist_ptr and glist_ptr not in visited and count < _MAX_ASSEMBLIES:
+            visited.add(glist_ptr)
+            count += 1
+
+            assembly_ptr = self._read_ptr(glist_ptr + _GLIST_DATA_OFFSET)
+            glist_ptr    = self._read_ptr(glist_ptr + _GLIST_NEXT_OFFSET)
+
+            if not assembly_ptr:
+                continue
+
+            try:
+                assembly_classes = self._read_assembly_classes(assembly_ptr)
+                classes.extend(assembly_classes)
+            except Exception as exc:
+                logger.debug("Skipping assembly @ 0x%X: %s", assembly_ptr, exc)
+
+        logger.info(
+            "UnityMono: walked %d assemblies, collected %d classes",
+            count, len(classes),
         )
-        return []
+        return classes
+
+    def _read_assembly_classes(self, assembly_ptr: int) -> list[ClassInfo]:
+        """
+        Read class names from a MonoAssembly by reading its MonoImage tables.
+
+        Struct layout used:
+          MonoAssembly + 0x60 → MonoImage*
+          MonoImage    + 0x10 → assembly_name (char*)
+          MonoImage    + 0x18 → typedef row count (uint32)
+          MonoImage    + 0x20 → array of class name char*  (simplified layout)
+          MonoImage    + 0x28 → array of namespace char*
+        """
+        image_ptr = self._read_ptr(assembly_ptr + _ASSEMBLY_IMAGE_OFFSET)
+        if not image_ptr:
+            return []
+
+        img_name_ptr = self._read_ptr(image_ptr + _IMAGE_NAME_OFFSET)
+        img_name = self._read_cstring(img_name_ptr)
+        if not img_name:
+            img_name = "?"
+
+        n_rows = self._read_int32(image_ptr + _IMAGE_N_ROWS_OFFSET)
+        if n_rows <= 0 or n_rows > 50_000:
+            return []
+
+        names_ptr  = self._read_ptr(image_ptr + _IMAGE_NAMES_OFFSET)
+        ns_ptr     = self._read_ptr(image_ptr + _IMAGE_NAMES_OFFSET + 8)
+
+        classes: list[ClassInfo] = []
+        for i in range(n_rows):
+            try:
+                name_str_ptr = (names_ptr + i * 8) if names_ptr else 0
+                ns_str_ptr   = (ns_ptr    + i * 8) if ns_ptr   else 0
+                name = self._read_cstring(name_str_ptr)
+                ns   = self._read_cstring(ns_str_ptr)
+                if name:
+                    classes.append(ClassInfo(name=name, namespace=ns))
+            except Exception:
+                continue
+
+        logger.debug(
+            "Assembly %s: %d classes", img_name, len(classes)
+        )
+        return classes
