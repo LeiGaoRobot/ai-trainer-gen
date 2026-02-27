@@ -405,3 +405,114 @@ class TestUnityMonoDumperWalkAssemblies:
         # Each capped iteration reads assembly_ptr + next_ptr = 2 reads per node
         # Plus the initial glist_ptr read = 1. Total <= _MAX_ASSEMBLIES * 2 + 1
         assert reader._pm.read_bytes.call_count <= _MAX_ASSEMBLIES * 2 + 1
+
+
+class TestUnrealDumperUE4SS:
+    """Test UE4SS detection and auto-injection trigger logic."""
+
+    @pytest.fixture
+    def ue4_info(self, tmp_path):
+        from src.detector.models import EngineInfo, EngineType
+        return EngineInfo(
+            type=EngineType.UE4, version="4.27", bitness=64,
+            exe_path=str(tmp_path / "Game.exe"),
+            game_dir=str(tmp_path),
+        )
+
+    def test_raises_with_no_dump_and_no_ue4ss(self, ue4_info, tmp_path):
+        """No ObjectDump.txt + no UE4SS markers → DumperError with install instructions."""
+        from src.dumper.ue import UnrealDumper
+        from src.exceptions import DumperError
+        dumper = UnrealDumper()
+        with pytest.raises(DumperError, match="UE4SS is not installed"):
+            dumper.dump(ue4_info)
+
+    def test_detect_ue4ss_true_when_marker_present(self, tmp_path):
+        """_detect_ue4ss returns True when any marker file exists."""
+        from src.dumper.ue import UnrealDumper
+        (tmp_path / "UE4SS.dll").touch()
+        assert UnrealDumper()._detect_ue4ss(tmp_path) is True
+
+    def test_detect_ue4ss_false_when_no_markers(self, tmp_path):
+        """_detect_ue4ss returns False when no marker files exist."""
+        from src.dumper.ue import UnrealDumper
+        assert UnrealDumper()._detect_ue4ss(tmp_path) is False
+
+    def test_detect_ue4ss_recognises_xinput_marker(self, tmp_path):
+        """xinput1_3.dll is also a valid UE4SS installation marker."""
+        from src.dumper.ue import UnrealDumper
+        (tmp_path / "xinput1_3.dll").touch()
+        assert UnrealDumper()._detect_ue4ss(tmp_path) is True
+
+    def test_raises_on_non_windows(self, ue4_info, tmp_path):
+        """On non-Windows, _trigger_ue4ss_dump raises DumperError about Windows."""
+        from unittest.mock import patch
+        from src.dumper.ue import UnrealDumper
+        from src.exceptions import DumperError
+        # UE4SS present but not Windows
+        (tmp_path / "UE4SS.dll").touch()
+        dumper = UnrealDumper()
+        with patch("src.dumper.ue._IS_WINDOWS", False):
+            with pytest.raises(DumperError, match="Windows"):
+                dumper._trigger_ue4ss_dump(tmp_path, ue4_info)
+
+    def test_trigger_waits_for_dump_to_appear(self, ue4_info, tmp_path):
+        """
+        _trigger_ue4ss_dump polls until ObjectDump.txt appears.
+        A background thread writes the file after a short delay.
+        """
+        import threading
+        from unittest.mock import patch
+        from src.dumper.ue import UnrealDumper
+
+        (tmp_path / "UE4SS.dll").touch()
+
+        def write_dump():
+            import time
+            time.sleep(0.15)
+            (tmp_path / "ObjectDump.txt").write_text(
+                "Class /Script/Engine.Actor\n"
+                "  [+0x0000] RootComponent : USceneComponent\n"
+            )
+
+        t = threading.Thread(target=write_dump)
+        t.start()
+
+        dumper = UnrealDumper()
+        with patch("src.dumper.ue._IS_WINDOWS", True), \
+             patch.object(dumper, "_send_f10_to_game_window", return_value=True):
+            dumper._trigger_ue4ss_dump(tmp_path, ue4_info)
+
+        t.join()
+        assert (tmp_path / "ObjectDump.txt").exists()
+
+    def test_trigger_raises_if_game_window_not_found(self, ue4_info, tmp_path):
+        """If game window cannot be found, raises DumperError with instructions."""
+        from unittest.mock import patch
+        from src.dumper.ue import UnrealDumper
+        from src.exceptions import DumperError
+
+        (tmp_path / "UE4SS.dll").touch()
+        dumper = UnrealDumper()
+        with patch("src.dumper.ue._IS_WINDOWS", True), \
+             patch.object(dumper, "_send_f10_to_game_window", return_value=False):
+            with pytest.raises(DumperError, match="Game window not found"):
+                dumper._trigger_ue4ss_dump(tmp_path, ue4_info)
+
+    def test_full_dump_with_preexisting_file(self, ue4_info, tmp_path):
+        """If ObjectDump.txt already exists, _trigger_ue4ss_dump is never called."""
+        from unittest.mock import patch
+        from src.dumper.ue import UnrealDumper
+
+        (tmp_path / "ObjectDump.txt").write_text(
+            "Class /Script/Engine.Actor\n"
+            "  [+0x0000] RootComponent : USceneComponent\n"
+        )
+
+        dumper = UnrealDumper()
+        with patch.object(dumper, "_trigger_ue4ss_dump") as mock_trigger:
+            result = dumper.dump(ue4_info)
+
+        mock_trigger.assert_not_called()
+        assert len(result.classes) == 1
+        assert result.classes[0].name == "Actor"
