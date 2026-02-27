@@ -143,3 +143,86 @@ class TestScriptManagerPage:
         buttons = page.findChildren(QPushButton)
         labels = [b.text().lower() for b in buttons]
         assert any("export" in lbl for lbl in labels)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. GenerateWorker
+# ─────────────────────────────────────────────────────────────────────────────
+
+from unittest.mock import patch, MagicMock
+
+
+class TestGenerateWorker:
+    """GenerateWorker — runs cmd_generate in a QThread, emits signals."""
+
+    def _make_worker(self, exe_path="/game/Game.exe", features=None, backend="stub"):
+        from src.gui.worker import GenerateWorker
+        from src.store.db import ScriptStore
+        import tempfile, os
+        store = ScriptStore(os.path.join(tempfile.mkdtemp(), "test.db"))
+        return GenerateWorker(
+            exe_path=exe_path,
+            features=features or ["infinite_health"],
+            store=store,
+            backend=backend,
+        )
+
+    def test_worker_emits_finished_on_success(self, tmp_path):
+        """On successful cmd_generate, worker emits finished(lua_path)."""
+        worker = self._make_worker()
+        results = []
+        worker.finished.connect(lambda p: results.append(p))
+
+        with patch("src.gui.worker.cmd_generate", return_value=tmp_path / "out.lua"):
+            worker.run()
+
+        assert len(results) == 1
+        assert results[0].endswith(".lua")
+
+    def test_worker_emits_failed_on_exception(self):
+        """When cmd_generate raises, worker emits failed(error_msg)."""
+        worker = self._make_worker()
+        errors = []
+        worker.failed.connect(lambda e: errors.append(e))
+
+        with patch("src.gui.worker.cmd_generate", side_effect=RuntimeError("boom")):
+            worker.run()
+
+        assert len(errors) == 1
+        assert "boom" in errors[0]
+
+    def test_worker_emits_progress_updates(self, tmp_path):
+        """progress_cb passed to cmd_generate causes progress_updated signals."""
+        worker = self._make_worker()
+        progress_values = []
+        worker.progress_updated.connect(lambda v: progress_values.append(v))
+
+        def fake_generate(*args, **kwargs):
+            cb = kwargs.get("progress_cb")
+            if cb:
+                cb(0.25, "step A")
+                cb(1.0,  "done")
+            return tmp_path / "out.lua"
+
+        with patch("src.gui.worker.cmd_generate", side_effect=fake_generate):
+            worker.run()
+
+        assert 0.25 in progress_values
+        assert 1.0  in progress_values
+
+    def test_worker_emits_log_for_progress_cb(self, tmp_path):
+        """progress_cb messages are forwarded as log_emitted signals."""
+        worker = self._make_worker()
+        log_lines = []
+        worker.log_emitted.connect(lambda m: log_lines.append(m))
+
+        def fake_generate(*args, **kwargs):
+            cb = kwargs.get("progress_cb")
+            if cb:
+                cb(0.5, "halfway there")
+            return tmp_path / "out.lua"
+
+        with patch("src.gui.worker.cmd_generate", side_effect=fake_generate):
+            worker.run()
+
+        assert any("halfway there" in line for line in log_lines)
