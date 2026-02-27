@@ -148,7 +148,7 @@ def build_parser() -> argparse.ArgumentParser:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
-def _parse_feature_type(feature: str):
+def _parse_feature_type(feature: str) -> "FeatureType":
     """Map feature name string to FeatureType enum; returns CUSTOM if unknown."""
     from src.analyzer.models import FeatureType
     try:
@@ -233,7 +233,7 @@ def cmd_generate(
 
     # 5. Resolve field accesses (engine-specific CE Lua expressions)
     context = EngineContext.from_engine_info(engine_info)
-    resolver = get_resolver(engine_info.type)
+    resolver = get_resolver(engine_info.type.value)
     resolutions = resolver.resolve(structure, context)
     context.resolutions = resolutions
     logger.debug("Resolved %d field accesses", len(resolutions))
@@ -285,7 +285,20 @@ def cmd_export(
     fmt: str,
     output_dir: Optional[str],
 ) -> Path:
-    """Export a cached script record to a file."""
+    """Export a cached script record to a file.
+
+    Args:
+        store:      ScriptStore instance.
+        record_id:  ID of the script record to export.
+        fmt:        Export format — ``"ct"`` (Cheat Table XML) or ``"lua"``.
+        output_dir: Directory to write the file (default: current directory).
+
+    Returns:
+        Path to the exported file.
+
+    Raises:
+        ValueError: If no record with *record_id* exists in the store.
+    """
     all_records = store.search(game_name="")
     record = next((r for r in all_records if r.id == record_id), None)
 
