@@ -10,11 +10,13 @@ Sandbox           — AOB pattern validation + hit-count checks
 SandboxResult     — result of a sandbox check
 """
 
-from src.ce_wrapper.models import CEProcess, InjectionResult
+from src.ce_wrapper.com_bridge import CEBridge
 from src.ce_wrapper.ct_builder import CTBuilder
+from src.ce_wrapper.models import CEProcess, InjectionResult
 from src.ce_wrapper.sandbox import Sandbox, SandboxResult
 
 __all__ = [
+    "CEBridge",
     "CEProcess",
     "InjectionResult",
     "CTBuilder",

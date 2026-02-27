@@ -12,6 +12,7 @@ Total target   ≥ 26 tests  (ensures overall suite hits ≥ 158)
 
 import xml.etree.ElementTree as ET
 from typing import Optional
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -253,3 +254,117 @@ class TestSandboxResult:
         r = SandboxResult(passed=False, detail="AOB not found")
         s = str(r).lower()
         assert "fail" in s or "error" in s or "not found" in s
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. CEBridge (COM automation wrapper)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestCEBridge:
+    """CEBridge — thin COM wrapper, tested entirely via injectable mock factory."""
+
+    def _make_app(self, *, pid=1234, name="Game.exe", scan_result=None):
+        """Build a mock CE COM application object."""
+        app = MagicMock()
+        app.OpenedProcessID = pid
+        app.OpenedProcessName = name
+        app.AOBScan.return_value = scan_result or []
+        return app
+
+    def _make_bridge(self, app):
+        """Return a CEBridge whose COM factory returns *app*."""
+        from src.ce_wrapper.com_bridge import CEBridge
+        return CEBridge(_com_factory=lambda: app)
+
+    def test_connect_returns_ce_process(self):
+        """connect() reads pid and name from COM app and returns CEProcess."""
+        app = self._make_app(pid=9999, name="MyGame.exe")
+        bridge = self._make_bridge(app)
+
+        with patch("src.ce_wrapper.com_bridge._IS_WINDOWS", True):
+            proc = bridge.connect()
+
+        from src.ce_wrapper.models import CEProcess
+        assert isinstance(proc, CEProcess)
+        assert proc.pid == 9999
+        assert proc.name == "MyGame.exe"
+
+    def test_connect_raises_on_non_windows(self):
+        """connect() raises BridgeNotAvailableError on non-Windows platforms."""
+        from src.ce_wrapper.com_bridge import CEBridge
+        from src.exceptions import BridgeNotAvailableError
+        bridge = CEBridge(_com_factory=lambda: MagicMock())
+
+        with patch("src.ce_wrapper.com_bridge._IS_WINDOWS", False):
+            with pytest.raises(BridgeNotAvailableError):
+                bridge.connect()
+
+    def test_inject_success(self):
+        """inject() calls ExecuteScript and returns InjectionResult(success=True)."""
+        app = self._make_app()
+        bridge = self._make_bridge(app)
+
+        with patch("src.ce_wrapper.com_bridge._IS_WINDOWS", True):
+            bridge.connect()
+
+        script = _make_script(lua_code="writeFloat(0x1000, 9999)")
+        from src.ce_wrapper.models import InjectionResult
+        result = bridge.inject(script, MagicMock())
+
+        assert isinstance(result, InjectionResult)
+        assert result.success is True
+        app.ExecuteScript.assert_called_once_with("writeFloat(0x1000, 9999)")
+
+    def test_inject_failure_returns_result_not_raises(self):
+        """If COM raises, inject() returns InjectionResult(success=False) without raising."""
+        app = self._make_app()
+        app.ExecuteScript.side_effect = RuntimeError("CE internal error")
+        bridge = self._make_bridge(app)
+
+        with patch("src.ce_wrapper.com_bridge._IS_WINDOWS", True):
+            bridge.connect()
+
+        result = bridge.inject(_make_script(), MagicMock())
+        assert result.success is False
+        assert "CE internal error" in result.error
+
+    def test_inject_raises_if_not_connected(self):
+        """inject() raises BridgeError when called before connect()."""
+        from src.ce_wrapper.com_bridge import CEBridge
+        from src.exceptions import BridgeError
+        bridge = CEBridge()
+        with pytest.raises(BridgeError, match="Not connected"):
+            bridge.inject(_make_script(), MagicMock())
+
+    def test_validate_aob_returns_hit_addresses(self):
+        """validate_aob() returns the list of addresses from COM scan."""
+        app = self._make_app(scan_result=[0xDEAD0000, 0xBEEF1234])
+        bridge = self._make_bridge(app)
+
+        with patch("src.ce_wrapper.com_bridge._IS_WINDOWS", True):
+            bridge.connect()
+
+        hits = bridge.validate_aob(_make_aob("48 8B 05 ?? ?? ?? ??"), MagicMock())
+        assert hits == [0xDEAD0000, 0xBEEF1234]
+
+    def test_validate_aob_empty_on_no_hits(self):
+        """validate_aob() returns [] when COM scan finds nothing."""
+        app = self._make_app(scan_result=[])
+        bridge = self._make_bridge(app)
+
+        with patch("src.ce_wrapper.com_bridge._IS_WINDOWS", True):
+            bridge.connect()
+
+        hits = bridge.validate_aob(_make_aob(), MagicMock())
+        assert hits == []
+
+    def test_context_manager_calls_close(self):
+        """Using CEBridge as a context manager calls close() on exit."""
+        from src.ce_wrapper.com_bridge import CEBridge
+        app = self._make_app()
+        bridge = CEBridge(_com_factory=lambda: app)
+
+        with patch("src.ce_wrapper.com_bridge._IS_WINDOWS", True):
+            with bridge as b:
+                b.connect()
+            assert bridge._app is None  # close() set it to None

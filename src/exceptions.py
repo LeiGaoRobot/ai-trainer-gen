@@ -16,6 +16,8 @@ __all__ = [
     "CEWrapperError",
     "ProcessNotFoundError",
     "ScriptExecutionError",
+    "BridgeError",
+    "BridgeNotAvailableError",
     "StoreError",
 ]
 
@@ -74,6 +76,14 @@ class ProcessNotFoundError(CEWrapperError):
 
 class ScriptExecutionError(CEWrapperError):
     """Raised when a Lua script execution fails inside CE."""
+
+
+class BridgeError(CEWrapperError):
+    """Raised when a CE COM bridge operation fails."""
+
+
+class BridgeNotAvailableError(BridgeError):
+    """Raised when the CE COM bridge is unavailable (non-Windows or CE not installed)."""
 
 
 # ── Store ─────────────────────────────────────────────────────────────────────
