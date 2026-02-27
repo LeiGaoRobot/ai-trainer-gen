@@ -44,7 +44,7 @@ _ASSEMBLY_IMAGE_OFFSET = 0x60      # MonoAssembly.image (MonoImage*)
 _IMAGE_NAME_OFFSET = 0x10          # MonoImage.assembly_name (char*)
 _IMAGE_N_ROWS_OFFSET = 0x18        # MonoImage typedef row count (uint32)
 _IMAGE_NAMES_OFFSET = 0x20         # MonoImage typedef name ptrs (char*[])
-_IMAGE_NS_OFFSET = 0x28        # MonoImage typedef namespace ptrs (char*[])
+_IMAGE_NS_OFFSET = 0x28          # MonoImage typedef namespace ptrs (char*[])
 _MAX_ASSEMBLIES = 512              # safety cap to prevent infinite loops
 
 
