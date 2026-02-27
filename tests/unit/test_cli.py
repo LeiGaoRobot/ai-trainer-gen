@@ -102,3 +102,153 @@ class TestExportCommand:
         with pytest.raises((ValueError, SystemExit, KeyError)):
             cmd_export(store=store, record_id=9999, fmt="ct",
                        output_dir=str(tmp_path))
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. generate command (Phase 2)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestGenerateCommand:
+    """Full pipeline with stub LLM + mocked dumper — no real game needed."""
+
+    @pytest.fixture
+    def fake_il2cpp_exe(self, tmp_path):
+        """64-bit PE with GameAssembly.dll → UNITY_IL2CPP detection."""
+        import struct
+        exe = tmp_path / "Game.exe"
+        dos = b"MZ" + b"\x00" * 0x3A + struct.pack("<I", 0x40)
+        pe  = b"PE\x00\x00" + struct.pack("<H", 0x8664)
+        exe.write_bytes(dos + b"\x00" * (0x40 - len(dos)) + pe)
+        (tmp_path / "GameAssembly.dll").touch()
+        return exe
+
+    @pytest.fixture
+    def fake_structure(self):
+        from src.dumper.models import StructureJSON, ClassInfo, FieldInfo
+        return StructureJSON(
+            engine="Unity_IL2CPP",
+            version="2022.3",
+            classes=[
+                ClassInfo(
+                    name="PlayerController", namespace="Game",
+                    fields=[FieldInfo(name="health", type="float", offset="0x58")],
+                ),
+            ],
+        )
+
+    def test_generate_creates_lua_file(self, store, fake_il2cpp_exe, fake_structure, tmp_path):
+        """Happy path: generates .lua file in output dir."""
+        from unittest.mock import patch, MagicMock
+        from src.cli.main import cmd_generate
+
+        with patch("src.cli.main.get_dumper") as mock_gd:
+            mock_dumper = MagicMock()
+            mock_dumper.dump.return_value = fake_structure
+            mock_gd.return_value = mock_dumper
+
+            out_path = cmd_generate(
+                exe_path=str(fake_il2cpp_exe),
+                feature="infinite_health",
+                output_dir=str(tmp_path / "out"),
+                no_cache=False,
+                store=store,
+                backend="stub",
+            )
+
+        assert out_path.exists()
+        code = out_path.read_text()
+        assert len(code) > 10  # stub produces non-empty script
+
+    def test_generate_saves_to_cache(self, store, fake_il2cpp_exe, fake_structure, tmp_path):
+        """After generation, record should be retrievable from store."""
+        from unittest.mock import patch, MagicMock
+        from src.cli.main import cmd_generate
+
+        with patch("src.cli.main.get_dumper") as mock_gd:
+            mock_dumper = MagicMock()
+            mock_dumper.dump.return_value = fake_structure
+            mock_gd.return_value = mock_dumper
+
+            cmd_generate(str(fake_il2cpp_exe), "infinite_health",
+                         str(tmp_path / "out"), False, store, "stub")
+
+        records = store.search("Game")
+        assert len(records) == 1
+        assert records[0].feature == "infinite_health"
+
+    def test_generate_cache_hit_skips_dumper(self, store, fake_il2cpp_exe, fake_structure, tmp_path):
+        """Second call with same args hits cache — dumper.dump() not called again."""
+        from unittest.mock import patch, MagicMock
+        from src.cli.main import cmd_generate
+
+        with patch("src.cli.main.get_dumper") as mock_gd:
+            mock_dumper = MagicMock()
+            mock_dumper.dump.return_value = fake_structure
+            mock_gd.return_value = mock_dumper
+
+            cmd_generate(str(fake_il2cpp_exe), "infinite_health",
+                         str(tmp_path / "out1"), False, store, "stub")
+            cmd_generate(str(fake_il2cpp_exe), "infinite_health",
+                         str(tmp_path / "out2"), False, store, "stub")
+
+        assert mock_dumper.dump.call_count == 1  # only called once
+
+    def test_generate_no_cache_forces_redump(self, store, fake_il2cpp_exe, fake_structure, tmp_path):
+        """--no-cache always calls dumper even on cache hit."""
+        from unittest.mock import patch, MagicMock
+        from src.cli.main import cmd_generate
+
+        with patch("src.cli.main.get_dumper") as mock_gd:
+            mock_dumper = MagicMock()
+            mock_dumper.dump.return_value = fake_structure
+            mock_gd.return_value = mock_dumper
+
+            cmd_generate(str(fake_il2cpp_exe), "infinite_health",
+                         str(tmp_path / "out1"), False, store, "stub")
+            cmd_generate(str(fake_il2cpp_exe), "infinite_health",
+                         str(tmp_path / "out2"), True, store, "stub")  # no_cache=True
+
+        assert mock_dumper.dump.call_count == 2
+
+    def test_main_generate_returns_0(self, tmp_path, fake_structure):
+        """main() returns exit code 0 on successful generation."""
+        import struct
+        from unittest.mock import patch, MagicMock
+        from src.cli.main import main
+
+        exe = tmp_path / "Game.exe"
+        dos = b"MZ" + b"\x00" * 0x3A + struct.pack("<I", 0x40)
+        pe  = b"PE\x00\x00" + struct.pack("<H", 0x8664)
+        exe.write_bytes(dos + b"\x00" * (0x40 - len(dos)) + pe)
+        (tmp_path / "GameAssembly.dll").touch()
+
+        with patch("src.cli.main.get_dumper") as mock_gd, \
+             patch("src.cli.main.ScriptStore") as mock_store_cls:
+            mock_dumper = MagicMock()
+            mock_dumper.dump.return_value = fake_structure
+            mock_gd.return_value = mock_dumper
+            mock_store = MagicMock()
+            mock_store.get.return_value = None
+            mock_store.save.return_value = 1
+            mock_store_cls.return_value = mock_store
+
+            rc = main([
+                "--db", str(tmp_path / "test.db"),
+                "generate",
+                "--exe", str(exe),
+                "--feature", "infinite_health",
+                "--output", str(tmp_path / "out"),
+                "--backend", "stub",
+            ])
+
+        assert rc == 0
+
+    def test_parse_feature_type_known(self):
+        from src.cli.main import _parse_feature_type
+        from src.analyzer.models import FeatureType
+        assert _parse_feature_type("infinite_health") == FeatureType.INFINITE_HEALTH
+
+    def test_parse_feature_type_unknown_returns_custom(self):
+        from src.cli.main import _parse_feature_type
+        from src.analyzer.models import FeatureType
+        assert _parse_feature_type("fly_mode") == FeatureType.CUSTOM

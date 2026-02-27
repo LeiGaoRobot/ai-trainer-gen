@@ -21,6 +21,8 @@ cmd_export) so they can be unit-tested without invoking argparse.
 """
 
 import argparse
+import hashlib
+import json as _json
 import logging
 import sys
 from pathlib import Path
@@ -28,10 +30,12 @@ from typing import Optional
 
 from src.store.db import ScriptStore
 from src.store.models import ScriptRecord
+from src.dumper.base import get_dumper
 
-__all__ = ["build_parser", "cmd_list", "cmd_export", "main"]
+__all__ = ["build_parser", "cmd_generate", "cmd_list", "cmd_export", "main"]
 
 logger = logging.getLogger(__name__)
+
 
 # ── Argument parser ────────────────────────────────────────────────────────────
 
@@ -87,6 +91,25 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help="Bypass ScriptStore cache and force regeneration",
     )
+    gen.add_argument(
+        "--backend",
+        choices=["stub", "anthropic", "openai"],
+        default="stub",
+        help="LLM backend to use (default: stub; use anthropic for production)",
+    )
+    gen.add_argument(
+        "--model",
+        default="",
+        metavar="MODEL",
+        help="LLM model override (default: backend-specific default)",
+    )
+    gen.add_argument(
+        "--api-key",
+        default="",
+        dest="api_key",
+        metavar="KEY",
+        help="API key (or use ANTHROPIC_API_KEY / OPENAI_API_KEY env var)",
+    )
 
     # ── list ──────────────────────────────────────────────────────────────
     lst = sub.add_parser("list", help="List cached trainer scripts")
@@ -122,17 +145,130 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# ── Helpers ───────────────────────────────────────────────────────────────────
+
+
+def _parse_feature_type(feature: str):
+    """Map feature name string to FeatureType enum; returns CUSTOM if unknown."""
+    from src.analyzer.models import FeatureType
+    try:
+        return FeatureType(feature.lower())
+    except ValueError:
+        return FeatureType.CUSTOM
+
+
+def _write_output(lua_code: str, game_name: str, feature: str,
+                  output_dir: Optional[str]) -> Path:
+    """Write Lua code to <output_dir>/<game>_<feature>.lua, return the path."""
+    out_dir = Path(output_dir) if output_dir else Path.cwd() / "output"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in f"{game_name}_{feature}")
+    out_path = out_dir / f"{safe}.lua"
+    out_path.write_text(lua_code, encoding="utf-8")
+    return out_path
+
+
 # ── Command implementations ───────────────────────────────────────────────────
 
 
-def cmd_list(store: ScriptStore, game: Optional[str]) -> None:
+def cmd_generate(
+    exe_path: str,
+    feature: str,
+    output_dir: Optional[str],
+    no_cache: bool,
+    store: ScriptStore,
+    backend: str = "stub",
+    model: str = "",
+    api_key: str = "",
+) -> Path:
     """
-    Print cached script records to stdout.
+    Full generation pipeline: detect → dump → resolve → analyze → cache → write.
 
     Args:
-        store: ScriptStore to query.
-        game:  Optional game name substring filter.
+        exe_path:   Absolute path to the game executable.
+        feature:    Feature name (e.g. "infinite_health").
+        output_dir: Directory to write the Lua file (default: ./output/).
+        no_cache:   If True, skip cache lookup and always re-generate.
+        store:      ScriptStore instance for caching.
+        backend:    LLM backend ("stub" | "anthropic" | "openai").
+        model:      Model override; empty = backend default.
+        api_key:    API key; empty = read from env.
+
+    Returns:
+        Path to the written .lua file.
+
+    Raises:
+        Any exception from detector / dumper / analyzer propagates to the caller.
     """
+    from src.detector import GameEngineDetector
+    from src.resolver.factory import get_resolver
+    from src.resolver.models import EngineContext
+    from src.analyzer.llm_analyzer import LLMAnalyzer, LLMConfig
+    from src.analyzer.models import TrainerFeature
+
+    # 1. Detect engine
+    logger.info("Detecting engine for: %s", exe_path)
+    engine_info = GameEngineDetector().detect(exe_path)
+    logger.info("Detected: %s", engine_info)
+
+    # 2. Stable cache key derived from the game directory path.
+    # Use the exe stem (e.g. "Game" from "Game.exe") as the human-readable
+    # game name; fall back to the parent directory name if exe_path unavailable.
+    exe_stem = Path(engine_info.exe_path).stem if engine_info.exe_path else ""
+    game_name = exe_stem or Path(engine_info.game_dir).name
+    game_hash = hashlib.sha256(engine_info.game_dir.encode()).hexdigest()[:16]
+
+    # 3. Cache lookup
+    if not no_cache:
+        cached = store.get(game_hash, feature)
+        if cached:
+            logger.info("Cache hit: %s / %s", game_name, feature)
+            print(f"[cache hit] Returning cached script for '{feature}'")
+            return _write_output(cached.lua_script, game_name, feature, output_dir)
+
+    # 4. Dump game structure
+    dumper = get_dumper(engine_info)
+    logger.info("Dumping structure via %s", type(dumper).__name__)
+    structure = dumper.dump(engine_info)
+
+    # 5. Resolve field accesses (engine-specific CE Lua expressions)
+    context = EngineContext.from_engine_info(engine_info)
+    resolver = get_resolver(engine_info.type)
+    resolutions = resolver.resolve(structure, context)
+    context.resolutions = resolutions
+    logger.debug("Resolved %d field accesses", len(resolutions))
+
+    # 6. Generate script via LLM
+    trainer_feature = TrainerFeature(
+        name=feature,
+        feature_type=_parse_feature_type(feature),
+    )
+    config = LLMConfig(backend=backend, model=model, api_key=api_key)
+    script = LLMAnalyzer(config).analyze(structure, trainer_feature, context)
+
+    # 7. Persist to cache
+    aob_json = _json.dumps([
+        {"pattern": s.pattern, "offset": s.offset, "module": s.module}
+        for s in script.aob_sigs
+    ]) if script.aob_sigs else None
+    record = ScriptRecord(
+        game_hash=game_hash,
+        game_name=game_name,
+        engine_type=str(engine_info.type),
+        feature=feature,
+        lua_script=script.lua_code,
+        aob_sigs=aob_json,
+    )
+    store.save(record)
+
+    # 8. Write output file
+    out_path = _write_output(script.lua_code, game_name, feature, output_dir)
+    logger.info("Script written to %s", out_path)
+    return out_path
+
+
+def cmd_list(store: ScriptStore, game: Optional[str]) -> None:
+    """Print cached script records to stdout."""
     records = store.search(game_name=game or "")
     if not records:
         print("0 cached scripts found.")
@@ -149,22 +285,7 @@ def cmd_export(
     fmt: str,
     output_dir: Optional[str],
 ) -> Path:
-    """
-    Export a cached script record to a file.
-
-    Args:
-        store:      ScriptStore to query.
-        record_id:  Id of the record to export.
-        fmt:        "ct" for Cheat Table XML, "lua" for raw Lua.
-        output_dir: Directory to write the file to (default: cwd).
-
-    Returns:
-        Path to the written file.
-
-    Raises:
-        ValueError: If *record_id* does not exist in the store.
-    """
-    # Retrieve by id: search across all records and filter
+    """Export a cached script record to a file."""
     all_records = store.search(game_name="")
     record = next((r for r in all_records if r.id == record_id), None)
 
@@ -179,7 +300,6 @@ def cmd_export(
         out_path = out_dir / filename
         out_path.write_text(record.lua_script, encoding="utf-8")
     else:
-        # ct format — build XML via CTBuilder
         from src.ce_wrapper.ct_builder import CTBuilder
         from src.analyzer.models import TrainerFeature, GeneratedScript, FeatureType
         feature = TrainerFeature(name=record.feature, feature_type=FeatureType.CUSTOM)
@@ -198,16 +318,10 @@ def cmd_export(
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    """
-    Main CLI entry point.
-
-    Returns:
-        Exit code (0 = success, non-zero = error).
-    """
+    """Main CLI entry point. Returns exit code."""
     parser = build_parser()
     ns = parser.parse_args(argv)
 
-    # Configure logging
     level = logging.DEBUG if ns.debug else logging.INFO
     logging.basicConfig(level=level, format="[%(levelname)s] %(message)s")
 
@@ -235,14 +349,22 @@ def main(argv: Optional[list[str]] = None) -> int:
         return 0
 
     if ns.subcommand == "generate":
-        # Full pipeline — requires detector → dumper → analyzer chain.
-        # Implemented in a later iteration; placeholder error for now.
-        print(
-            "generate subcommand: full pipeline not yet wired up. "
-            "Run with --stub once the pipeline module is available.",
-            file=sys.stderr,
-        )
-        return 1
+        try:
+            cmd_generate(
+                exe_path=ns.exe,
+                feature=ns.feature,
+                output_dir=getattr(ns, "output", None),
+                no_cache=ns.no_cache,
+                store=store,
+                backend=getattr(ns, "backend", "stub"),
+                model=getattr(ns, "model", ""),
+                api_key=getattr(ns, "api_key", ""),
+            )
+        except Exception as exc:
+            logger.debug("generate failed", exc_info=True)
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+        return 0
 
     parser.print_help()
     return 0
