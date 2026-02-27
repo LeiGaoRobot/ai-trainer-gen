@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from src.gui.viewmodels import ProcessListViewModel
+from src.gui.viewmodels import ProcessInfo, ProcessListViewModel
 
 __all__ = ["ProcessSelectPage"]
 
@@ -94,16 +94,20 @@ class ProcessSelectPage(QWidget):
         """Scan running processes and populate the list."""
         try:
             import psutil
-            procs = [
-                __import__("src.gui.viewmodels", fromlist=["ProcessInfo"]).ProcessInfo(
-                    pid=p.pid, name=p.name()
-                )
-                for p in psutil.process_iter(["pid", "name"])
-            ]
+            procs = []
+            for p in psutil.process_iter(["pid", "name", "exe"]):
+                try:
+                    info = p.info
+                    procs.append(ProcessInfo(
+                        pid=info["pid"],
+                        name=info["name"] or "",
+                        exe_path=info.get("exe") or "",
+                    ))
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
         except ImportError:
             # psutil not available — show placeholder entries
-            from src.gui.viewmodels import ProcessInfo
-            procs = [ProcessInfo(pid=0, name="(psutil not installed — demo mode)")]
+            procs = [ProcessInfo(pid=0, name="(psutil not installed — demo mode)", exe_path="")]
         self._vm.set_processes(procs)
         self._refresh_list()
 

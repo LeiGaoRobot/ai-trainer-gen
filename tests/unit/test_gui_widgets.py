@@ -226,3 +226,92 @@ class TestGenerateWorker:
             worker.run()
 
         assert any("halfway there" in line for line in log_lines)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. MainWindowWiring
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestMainWindowWiring:
+    """MainWindow — Generate button launches worker, signals route to pages."""
+
+    def _make_window(self, tmp_path):
+        from src.gui.main_window import MainWindow
+        from unittest.mock import patch
+        with patch("src.gui.main_window.tempfile.gettempdir", return_value=str(tmp_path)):
+            win = MainWindow()
+        return win
+
+    def _click_generate(self, win):
+        """Click Generate with both GenerateWorker and QThread fully mocked."""
+        from unittest.mock import patch, MagicMock
+
+        with patch("src.gui.main_window.GenerateWorker") as MockWorker, \
+             patch("src.gui.main_window.QThread") as MockThread:
+            mock_w = MagicMock()
+            MockWorker.return_value = mock_w
+            for sig in ("finished", "failed", "log_emitted", "progress_updated"):
+                setattr(mock_w, sig, MagicMock())
+            MockThread.return_value = MagicMock()
+            win._page_features._generate_btn.click()
+
+    def test_generate_navigates_to_generate_page(self, tmp_path, qtbot):
+        """Clicking Generate button navigates to GeneratePage (index 2)."""
+        from src.gui.viewmodels import ProcessInfo
+
+        win = self._make_window(tmp_path)
+        qtbot.addWidget(win)
+
+        win._page_process._vm.selected = ProcessInfo(
+            pid=1, name="Game.exe", exe_path="/fake/Game.exe"
+        )
+        win._page_features._vm.toggle("infinite_health")
+        self._click_generate(win)
+
+        assert win._stack.currentIndex() == 2  # PAGE_GENERATE
+
+    def test_generate_resets_generate_page(self, tmp_path, qtbot):
+        """Clicking Generate calls reset() on GeneratePage before starting."""
+        from src.gui.viewmodels import ProcessInfo
+
+        win = self._make_window(tmp_path)
+        qtbot.addWidget(win)
+
+        win._page_process._vm.selected = ProcessInfo(
+            pid=1, name="Game.exe", exe_path="/fake/Game.exe"
+        )
+        win._page_generate._log_view.appendPlainText("old log")  # dirty state
+        self._click_generate(win)
+
+        assert win._page_generate._log_view.toPlainText() == ""  # was reset
+
+    def test_worker_finished_navigates_to_script_manager(self, tmp_path, qtbot):
+        """On worker finished signal, MainWindow navigates to ScriptManagerPage (index 3)."""
+        from src.gui.viewmodels import ProcessInfo
+
+        win = self._make_window(tmp_path)
+        qtbot.addWidget(win)
+
+        win._page_process._vm.selected = ProcessInfo(
+            pid=1, name="Game.exe", exe_path="/fake/Game.exe"
+        )
+        self._click_generate(win)
+
+        # Simulate the worker emitting finished
+        win._on_generate_finished("/output/Game_infinite_health.lua")
+        assert win._stack.currentIndex() == 3  # PAGE_SCRIPT_MANAGER
+
+    def test_worker_failed_stays_on_generate_page(self, tmp_path, qtbot):
+        """On worker failed signal, MainWindow stays on GeneratePage (index 2)."""
+        from src.gui.viewmodels import ProcessInfo
+
+        win = self._make_window(tmp_path)
+        qtbot.addWidget(win)
+
+        win._page_process._vm.selected = ProcessInfo(
+            pid=1, name="Game.exe", exe_path="/fake/Game.exe"
+        )
+        self._click_generate(win)
+
+        win._on_generate_failed("Engine detection failed: file not found")
+        assert win._stack.currentIndex() == 2  # still on GeneratePage

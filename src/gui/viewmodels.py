@@ -39,8 +39,9 @@ logger = logging.getLogger(__name__)
 @dataclass
 class ProcessInfo:
     """Lightweight descriptor for a running OS process."""
-    pid:  int
-    name: str
+    pid:      int
+    name:     str
+    exe_path: str = ""  # absolute path to the process executable, if accessible
 
     def __str__(self) -> str:
         return f"{self.name} (pid={self.pid})"
