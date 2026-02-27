@@ -104,6 +104,11 @@ class MainWindow(QMainWindow):
 
     def _on_generate_clicked(self) -> None:
         """Navigate to GeneratePage and launch the generation worker."""
+        # Clean up any previous run
+        if self._thread is not None and self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait(3000)  # wait up to 3s
+
         proc = self._page_process._vm.selected
         exe_path = proc.exe_path if proc else ""
 
@@ -114,6 +119,7 @@ class MainWindow(QMainWindow):
 
         self.go_to(PAGE_GENERATE)
         self._page_generate.reset()
+        self._page_generate._back_btn.setEnabled(False)
 
         self._worker = GenerateWorker(
             exe_path=exe_path,
@@ -135,12 +141,14 @@ class MainWindow(QMainWindow):
 
     def _on_generate_finished(self, lua_path: str) -> None:
         """Called when the worker emits finished(lua_path)."""
+        self._page_generate._back_btn.setEnabled(True)
         self._page_generate.append_log(f"Script saved: {lua_path}")
         self._page_generate.set_progress(1.0)
         self.go_to(PAGE_SCRIPT_MANAGER)
 
     def _on_generate_failed(self, error: str) -> None:
         """Called when the worker emits failed(error); stays on GeneratePage."""
+        self._page_generate._back_btn.setEnabled(True)
         self._page_generate.append_log(f"Error: {error}")
         # Stay on GeneratePage so user can read the error
 

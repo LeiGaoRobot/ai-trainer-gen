@@ -65,6 +65,8 @@ class GenerateWorker(QObject):
 
     def run(self) -> None:
         """Entry point — connect QThread.started to this slot."""
+        # Multiple selected features are joined into one request string;
+        # cmd_generate's LLM will treat it as a combined custom feature.
         feature = ", ".join(self._features) if self._features else "general"
 
         def on_progress(pct: float, msg: str) -> None:

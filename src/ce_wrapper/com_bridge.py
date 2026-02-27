@@ -73,13 +73,13 @@ class CEBridge:
                 "On other platforms, use CTBuilder for offline .ct export only."
             )
         factory = self._com_factory or self._default_com_factory
-        self._app = factory()
         try:
+            self._app = factory()
             pid  = self._app.OpenedProcessID
             name = self._app.OpenedProcessName
         except Exception as exc:  # noqa: BLE001
             self._app = None
-            raise BridgeError(f"CE is running but no process is attached: {exc}") from exc
+            raise BridgeError(f"Failed to connect to CE: {exc}") from exc
         logger.info("CEBridge: connected to %s (pid=%s)", name, pid)
         return CEProcess(pid=pid, name=name)
 
