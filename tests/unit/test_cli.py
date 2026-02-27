@@ -252,3 +252,109 @@ class TestGenerateCommand:
         from src.cli.main import _parse_feature_type
         from src.analyzer.models import FeatureType
         assert _parse_feature_type("fly_mode") == FeatureType.CUSTOM
+
+    @pytest.fixture
+    def fake_script(self):
+        from src.analyzer.models import GeneratedScript, TrainerFeature, FeatureType
+        feature = TrainerFeature(name="infinite_health", feature_type=FeatureType.INFINITE_HEALTH)
+        return GeneratedScript(lua_code="-- stub lua\nprint('health')", feature=feature)
+
+    @staticmethod
+    def _make_engine_info(exe_path: str):
+        """Build a minimal EngineInfo for test use."""
+        import os
+        from src.detector.models import EngineInfo, EngineType
+        return EngineInfo(
+            type=EngineType.UNITY_IL2CPP,
+            version="2022.3",
+            bitness=64,
+            exe_path=exe_path,
+            game_dir=os.path.dirname(exe_path),
+        )
+
+    def test_progress_cb_none_does_not_raise(self, fake_il2cpp_exe, fake_structure, fake_script, tmp_path):
+        """cmd_generate with progress_cb=None (default) runs without error."""
+        from unittest.mock import patch
+        from src.cli.main import cmd_generate
+        from src.store.db import ScriptStore
+
+        store = ScriptStore(str(tmp_path / "s.db"))
+
+        with patch("src.cli.main.GameEngineDetector") as mock_det, \
+             patch("src.cli.main.get_dumper") as mock_get_dumper, \
+             patch("src.cli.main.get_resolver") as mock_res_f, \
+             patch("src.cli.main.LLMAnalyzer") as mock_llm:
+            mock_det.return_value.detect.return_value = self._make_engine_info(str(fake_il2cpp_exe))
+            mock_get_dumper.return_value.dump.return_value = fake_structure
+            mock_res_f.return_value.resolve.return_value = []
+            mock_llm.return_value.analyze.return_value = fake_script
+
+            result = cmd_generate(
+                exe_path=str(fake_il2cpp_exe),
+                feature="infinite_health",
+                output_dir=str(tmp_path),
+                no_cache=False,
+                store=store,
+            )
+        assert result.suffix == ".lua"
+
+    def test_progress_cb_called_at_each_step(self, fake_il2cpp_exe, fake_structure, fake_script, tmp_path):
+        """progress_cb is invoked multiple times with non-decreasing pct."""
+        from unittest.mock import patch
+        from src.cli.main import cmd_generate
+        from src.store.db import ScriptStore
+
+        store = ScriptStore(str(tmp_path / "s.db"))
+        calls: list = []
+
+        with patch("src.cli.main.GameEngineDetector") as mock_det, \
+             patch("src.cli.main.get_dumper") as mock_get_dumper, \
+             patch("src.cli.main.get_resolver") as mock_res_f, \
+             patch("src.cli.main.LLMAnalyzer") as mock_llm:
+            mock_det.return_value.detect.return_value = self._make_engine_info(str(fake_il2cpp_exe))
+            mock_get_dumper.return_value.dump.return_value = fake_structure
+            mock_res_f.return_value.resolve.return_value = []
+            mock_llm.return_value.analyze.return_value = fake_script
+
+            cmd_generate(
+                exe_path=str(fake_il2cpp_exe),
+                feature="infinite_health",
+                output_dir=str(tmp_path),
+                no_cache=False,
+                store=store,
+                progress_cb=lambda pct, msg: calls.append((pct, msg)),
+            )
+
+        assert len(calls) >= 3
+        percentages = [pct for pct, _ in calls]
+        assert percentages == sorted(percentages), "progress must be non-decreasing"
+
+    def test_progress_cb_final_value_is_1(self, fake_il2cpp_exe, fake_structure, fake_script, tmp_path):
+        """The last progress_cb call always has pct == 1.0."""
+        from unittest.mock import patch
+        from src.cli.main import cmd_generate
+        from src.store.db import ScriptStore
+        import pytest
+
+        store = ScriptStore(str(tmp_path / "s.db"))
+        last_pct: list = []
+
+        with patch("src.cli.main.GameEngineDetector") as mock_det, \
+             patch("src.cli.main.get_dumper") as mock_get_dumper, \
+             patch("src.cli.main.get_resolver") as mock_res_f, \
+             patch("src.cli.main.LLMAnalyzer") as mock_llm:
+            mock_det.return_value.detect.return_value = self._make_engine_info(str(fake_il2cpp_exe))
+            mock_get_dumper.return_value.dump.return_value = fake_structure
+            mock_res_f.return_value.resolve.return_value = []
+            mock_llm.return_value.analyze.return_value = fake_script
+
+            cmd_generate(
+                exe_path=str(fake_il2cpp_exe),
+                feature="infinite_health",
+                output_dir=str(tmp_path),
+                no_cache=False,
+                store=store,
+                progress_cb=lambda pct, msg: last_pct.append(pct),
+            )
+
+        assert last_pct[-1] == pytest.approx(1.0)

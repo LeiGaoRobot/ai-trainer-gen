@@ -26,11 +26,16 @@ import json as _json
 import logging
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from src.store.db import ScriptStore
 from src.store.models import ScriptRecord
 from src.dumper.base import get_dumper
+from src.detector import GameEngineDetector
+from src.resolver.factory import get_resolver
+from src.resolver.models import EngineContext
+from src.analyzer.llm_analyzer import LLMAnalyzer, LLMConfig
+from src.analyzer.models import TrainerFeature
 
 __all__ = ["build_parser", "cmd_generate", "cmd_list", "cmd_export", "main"]
 
@@ -180,19 +185,23 @@ def cmd_generate(
     backend: str = "stub",
     model: str = "",
     api_key: str = "",
+    progress_cb: Optional[Callable[[float, str], None]] = None,
 ) -> Path:
     """
     Full generation pipeline: detect → dump → resolve → analyze → cache → write.
 
     Args:
-        exe_path:   Absolute path to the game executable.
-        feature:    Feature name (e.g. "infinite_health").
-        output_dir: Directory to write the Lua file (default: ./output/).
-        no_cache:   If True, skip cache lookup and always re-generate.
-        store:      ScriptStore instance for caching.
-        backend:    LLM backend ("stub" | "anthropic" | "openai").
-        model:      Model override; empty = backend default.
-        api_key:    API key; empty = read from env.
+        exe_path:    Absolute path to the game executable.
+        feature:     Feature name (e.g. "infinite_health").
+        output_dir:  Directory to write the Lua file (default: ./output/).
+        no_cache:    If True, skip cache lookup and always re-generate.
+        store:       ScriptStore instance for caching.
+        backend:     LLM backend ("stub" | "anthropic" | "openai").
+        model:       Model override; empty = backend default.
+        api_key:     API key; empty = read from env.
+        progress_cb: Optional callback(pct: float, msg: str) called at each
+                     major pipeline step.  pct is in [0, 1], non-decreasing.
+                     Omit (or pass None) for backward-compatible behaviour.
 
     Returns:
         Path to the written .lua file.
@@ -200,16 +209,15 @@ def cmd_generate(
     Raises:
         Any exception from detector / dumper / analyzer propagates to the caller.
     """
-    from src.detector import GameEngineDetector
-    from src.resolver.factory import get_resolver
-    from src.resolver.models import EngineContext
-    from src.analyzer.llm_analyzer import LLMAnalyzer, LLMConfig
-    from src.analyzer.models import TrainerFeature
+    def _report(pct: float, msg: str) -> None:
+        logger.info(msg)
+        if progress_cb:
+            progress_cb(pct, msg)
 
     # 1. Detect engine
-    logger.info("Detecting engine for: %s", exe_path)
+    _report(0.125, f"Detecting engine for: {exe_path}")
     engine_info = GameEngineDetector().detect(exe_path)
-    logger.info("Detected: %s", engine_info)
+    _report(0.25, f"Detected: {engine_info}")
 
     # 2. Stable cache key derived from the game directory path.
     # Use the exe stem (e.g. "Game" from "Game.exe") as the human-readable
@@ -222,16 +230,17 @@ def cmd_generate(
     if not no_cache:
         cached = store.get(game_hash, feature)
         if cached:
-            logger.info("Cache hit: %s / %s", game_name, feature)
+            _report(1.0, f"Cache hit: returning cached script for '{feature}'")
             print(f"[cache hit] Returning cached script for '{feature}'")
             return _write_output(cached.lua_script, game_name, feature, output_dir)
 
     # 4. Dump game structure
+    _report(0.375, "Dumping game structure")
     dumper = get_dumper(engine_info)
-    logger.info("Dumping structure via %s", type(dumper).__name__)
     structure = dumper.dump(engine_info)
 
     # 5. Resolve field accesses (engine-specific CE Lua expressions)
+    _report(0.5, "Resolving field accesses")
     context = EngineContext.from_engine_info(engine_info)
     resolver = get_resolver(engine_info.type.value)
     resolutions = resolver.resolve(structure, context)
@@ -239,6 +248,7 @@ def cmd_generate(
     logger.debug("Resolved %d field accesses", len(resolutions))
 
     # 6. Generate script via LLM
+    _report(0.75, f"Generating script for feature '{feature}'")
     trainer_feature = TrainerFeature(
         name=feature,
         feature_type=_parse_feature_type(feature),
@@ -247,6 +257,7 @@ def cmd_generate(
     script = LLMAnalyzer(config).analyze(structure, trainer_feature, context)
 
     # 7. Persist to cache
+    _report(0.875, "Persisting to cache")
     aob_json = _json.dumps([
         {"pattern": s.pattern, "offset": s.offset, "module": s.module}
         for s in script.aob_sigs
@@ -263,7 +274,7 @@ def cmd_generate(
 
     # 8. Write output file
     out_path = _write_output(script.lua_code, game_name, feature, output_dir)
-    logger.info("Script written to %s", out_path)
+    _report(1.0, f"Script written to {out_path}")
     return out_path
 
 
