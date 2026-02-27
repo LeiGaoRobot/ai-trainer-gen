@@ -44,6 +44,7 @@ _ASSEMBLY_IMAGE_OFFSET = 0x60      # MonoAssembly.image (MonoImage*)
 _IMAGE_NAME_OFFSET = 0x10          # MonoImage.assembly_name (char*)
 _IMAGE_N_ROWS_OFFSET = 0x18        # MonoImage typedef row count (uint32)
 _IMAGE_NAMES_OFFSET = 0x20         # MonoImage typedef name ptrs (char*[])
+_IMAGE_NS_OFFSET = 0x28        # MonoImage typedef namespace ptrs (char*[])
 _MAX_ASSEMBLIES = 512              # safety cap to prevent infinite loops
 
 
@@ -187,7 +188,7 @@ class _MonoReader:
         return int.from_bytes(self._pm.read_bytes(addr, 8), "little")
 
     def _read_int32(self, addr: int) -> int:
-        """Read a 4-byte little-endian unsigned int from the target process."""
+        """Read a 4-byte little-endian unsigned integer from the target process."""
         return int.from_bytes(self._pm.read_bytes(addr, 4), "little")
 
     def _read_cstring(self, addr: int, max_len: int = 256) -> str:
@@ -220,7 +221,7 @@ class _MonoReader:
         if fn_va is None:
             raise DumperError("mono_domain_get export not resolved")
 
-        code = self._pm.read_bytes(fn_va, 32)
+        code = self._pm.read_bytes(fn_va, 64)
 
         for i in range(len(code) - 7):
             if code[i:i+3] == b"\x48\x8B\x05":
@@ -272,7 +273,7 @@ class _MonoReader:
                 assembly_classes = self._read_assembly_classes(assembly_ptr)
                 classes.extend(assembly_classes)
             except Exception as exc:
-                logger.debug("Skipping assembly @ 0x%X: %s", assembly_ptr, exc)
+                logger.warning("Skipping assembly @ 0x%X: %s", assembly_ptr, exc)
 
         logger.info(
             "UnityMono: walked %d assemblies, collected %d classes",
@@ -305,13 +306,15 @@ class _MonoReader:
             return []
 
         names_ptr  = self._read_ptr(image_ptr + _IMAGE_NAMES_OFFSET)
-        ns_ptr     = self._read_ptr(image_ptr + _IMAGE_NAMES_OFFSET + 8)
+        ns_ptr     = self._read_ptr(image_ptr + _IMAGE_NS_OFFSET)
 
         classes: list[ClassInfo] = []
         for i in range(n_rows):
             try:
-                name_str_ptr = (names_ptr + i * 8) if names_ptr else 0
-                ns_str_ptr   = (ns_ptr    + i * 8) if ns_ptr   else 0
+                name_entry   = names_ptr + i * 8
+                ns_entry     = ns_ptr   + i * 8
+                name_str_ptr = self._read_ptr(name_entry) if names_ptr else 0
+                ns_str_ptr   = self._read_ptr(ns_entry)   if ns_ptr   else 0
                 name = self._read_cstring(name_str_ptr)
                 ns   = self._read_cstring(ns_str_ptr)
                 if name:

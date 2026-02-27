@@ -301,10 +301,11 @@ class TestUnityMonoDumperWalkAssemblies:
 
         # Assembly image name string
         IMG_NAME_STR = 0x50000
-        # Class name string
-        CLASS_NAME_STR = 0x60000
-        # Namespace string
-        NS_STR = 0x70000
+        # NAMES_ARRAY and NS_ARRAY are arrays of 8-byte char* pointers
+        NAMES_ARRAY    = 0x60000
+        NS_ARRAY       = 0x61000
+        NAME_STR       = 0x62000
+        NS_STR_VAL     = 0x63000
 
         import struct
 
@@ -323,13 +324,18 @@ class TestUnityMonoDumperWalkAssemblies:
             IMAGE + 0x10: mk_ptr(IMG_NAME_STR),
             # MonoImage->n_typedef_rows at IMAGE + 0x18
             IMAGE + 0x18: struct.pack("<I", 1),  # 1 class
-            # MonoImage->typedef_names at IMAGE + 0x20 (ptr to array of char*)
-            IMAGE + 0x20: mk_ptr(CLASS_NAME_STR),
-            IMAGE + 0x28: mk_ptr(NS_STR),
-            # Strings
-            IMG_NAME_STR:   b"Assembly-CSharp\x00",
-            CLASS_NAME_STR: b"PlayerController\x00",
-            NS_STR:         b"Game.Player\x00",
+            # MonoImage->typedef_names ptr at IMAGE + 0x20 -> points to NAMES_ARRAY
+            IMAGE + 0x20: mk_ptr(NAMES_ARRAY),
+            # MonoImage->typedef_namespaces ptr at IMAGE + 0x28 -> points to NS_ARRAY
+            IMAGE + 0x28: mk_ptr(NS_ARRAY),
+            # NAMES_ARRAY[0] -> pointer to the class name string
+            NAMES_ARRAY + 0x00: mk_ptr(NAME_STR),
+            # NS_ARRAY[0] -> pointer to the namespace string
+            NS_ARRAY    + 0x00: mk_ptr(NS_STR_VAL),
+            # Actual strings
+            IMG_NAME_STR: b"Assembly-CSharp\x00",
+            NAME_STR:     b"PlayerController\x00",
+            NS_STR_VAL:   b"Game.Player\x00",
         }
 
         def fake_read(addr, size):
@@ -390,8 +396,12 @@ class TestUnityMonoDumperWalkAssemblies:
 
         reader._pm.read_bytes.side_effect = lambda a, s: memory.get(a, b"\x00"*s)[:s]
 
+        from src.dumper.unity_mono import _MAX_ASSEMBLIES
+
         with patch.object(reader, "_find_root_domain_ptr", return_value=DOMAIN):
             classes = reader._walk_assemblies()
 
-        # Should not hang; returns empty list (all NULL assemblies)
-        assert isinstance(classes, list)
+        assert classes == []
+        # Each capped iteration reads assembly_ptr + next_ptr = 2 reads per node
+        # Plus the initial glist_ptr read = 1. Total <= _MAX_ASSEMBLIES * 2 + 1
+        assert reader._pm.read_bytes.call_count <= _MAX_ASSEMBLIES * 2 + 1
