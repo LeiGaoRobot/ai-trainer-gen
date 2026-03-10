@@ -99,6 +99,23 @@ class TestFeatureConfigViewModel:
         vm = self._vm()
         assert vm.custom_description == ""
 
+    def test_confirmed_defaults_to_false(self):
+        vm = self._vm()
+        assert vm.confirmed is False
+
+    def test_can_generate_requires_selection_and_confirmed(self):
+        vm = self._vm()
+        assert vm.can_generate is False
+        vm.toggle(vm.standard_features[0])
+        assert vm.can_generate is False  # not confirmed yet
+        vm.confirmed = True
+        assert vm.can_generate is True
+
+    def test_can_generate_false_when_confirmed_but_no_selection(self):
+        vm = self._vm()
+        vm.confirmed = True
+        assert vm.can_generate is False
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 3. GenerateViewModel

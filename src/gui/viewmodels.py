@@ -114,6 +114,7 @@ class FeatureConfigViewModel:
         self.standard_features:  list[str] = list(_STANDARD_FEATURES)
         self.selected_features:  list[str] = []
         self.custom_description: str        = ""
+        self.confirmed:          bool       = False
 
     def toggle(self, feature: str) -> None:
         """Add *feature* if not selected; remove it if already selected."""
@@ -126,6 +127,11 @@ class FeatureConfigViewModel:
     def has_selection(self) -> bool:
         """True iff at least one feature (standard or custom) is chosen."""
         return bool(self.selected_features) or bool(self.custom_description.strip())
+
+    @property
+    def can_generate(self) -> bool:
+        """True iff the user has selected features and confirmed the selection."""
+        return self.has_selection and self.confirmed
 
 
 # ── GenerateViewModel ──────────────────────────────────────────────────────────

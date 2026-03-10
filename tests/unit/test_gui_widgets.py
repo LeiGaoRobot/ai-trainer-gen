@@ -101,6 +101,29 @@ class TestFeatureConfigPage:
         labels = [b.text().lower() for b in buttons]
         assert any("generate" in lbl for lbl in labels)
 
+    def test_has_confirm_checkbox(self, app):
+        from src.gui.pages.feature_config import FeatureConfigPage
+        from PyQt6.QtWidgets import QCheckBox
+        page = FeatureConfigPage()
+        labels = [cb.text().lower() for cb in page.findChildren(QCheckBox)]
+        assert any("confirm" in lbl for lbl in labels)
+
+    def test_generate_button_disabled_until_confirmed(self, app):
+        from src.gui.pages.feature_config import FeatureConfigPage
+        page = FeatureConfigPage()
+        # Initially disabled
+        assert not page._generate_btn.isEnabled()
+        # Toggle a feature — still disabled without confirm
+        first_feature = list(page._checkboxes.keys())[0]
+        page._checkboxes[first_feature].setChecked(True)
+        assert not page._generate_btn.isEnabled()
+        # Check confirm — now enabled
+        page._confirm_cb.setChecked(True)
+        assert page._generate_btn.isEnabled()
+        # Uncheck confirm — disabled again
+        page._confirm_cb.setChecked(False)
+        assert not page._generate_btn.isEnabled()
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # 4. GeneratePage
@@ -246,6 +269,9 @@ class TestMainWindowWiring:
         """Click Generate with both GenerateWorker and QThread fully mocked."""
         from unittest.mock import patch, MagicMock
 
+        # Ensure the confirm checkbox is checked so the Generate button is enabled
+        win._page_features._confirm_cb.setChecked(True)
+
         with patch("src.gui.main_window.GenerateWorker") as MockWorker, \
              patch("src.gui.main_window.QThread") as MockThread:
             mock_w = MagicMock()
@@ -280,6 +306,7 @@ class TestMainWindowWiring:
         win._page_process._vm.selected = ProcessInfo(
             pid=1, name="Game.exe", exe_path="/fake/Game.exe"
         )
+        win._page_features._vm.toggle("infinite_health")
         win._page_generate._log_view.appendPlainText("old log")  # dirty state
         self._click_generate(win)
 
@@ -311,6 +338,7 @@ class TestMainWindowWiring:
         win._page_process._vm.selected = ProcessInfo(
             pid=1, name="Game.exe", exe_path="/fake/Game.exe"
         )
+        win._page_features._vm.toggle("infinite_health")
         self._click_generate(win)
 
         win._on_generate_failed("Engine detection failed: file not found")

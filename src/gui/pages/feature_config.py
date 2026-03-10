@@ -85,24 +85,40 @@ class FeatureConfigPage(QWidget):
         layout.addWidget(QLabel("Custom description (optional):"))
         self._custom_edit = QLineEdit()
         self._custom_edit.setPlaceholderText("e.g. freeze enemy spawn timer")
-        self._custom_edit.textChanged.connect(
-            lambda t: setattr(self._vm, "custom_description", t)
-        )
+        self._custom_edit.textChanged.connect(self._on_custom_text_changed)
         layout.addWidget(self._custom_edit)
 
         layout.addStretch()
+
+        # Confirm checkbox
+        self._confirm_cb = QCheckBox("I confirm the selected features")
+        self._confirm_cb.toggled.connect(self._on_confirm_toggle)
+        layout.addWidget(self._confirm_cb)
 
         # Generate button
         btn_row = QHBoxLayout()
         btn_row.addStretch()
         self._generate_btn = QPushButton("Generate →")
+        self._generate_btn.setEnabled(False)
         btn_row.addWidget(self._generate_btn)
         layout.addLayout(btn_row)
 
     # ── Slots ──────────────────────────────────────────────────────────────
+
+    def _on_custom_text_changed(self, text: str) -> None:
+        self._vm.custom_description = text
+        self._sync_generate_btn()
 
     def _on_toggle(self, feature_id: str, checked: bool) -> None:
         if checked and feature_id not in self._vm.selected_features:
             self._vm.toggle(feature_id)
         elif not checked and feature_id in self._vm.selected_features:
             self._vm.toggle(feature_id)
+        self._sync_generate_btn()
+
+    def _on_confirm_toggle(self, checked: bool) -> None:
+        self._vm.confirmed = checked
+        self._sync_generate_btn()
+
+    def _sync_generate_btn(self) -> None:
+        self._generate_btn.setEnabled(self._vm.can_generate)
